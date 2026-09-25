@@ -50,8 +50,8 @@ def add_expense(data, day, cents, category, note=""):
     return exp
 
 
-def list_lines(expenses):
-    rows = sorted(expenses, key=lambda e: (e["date"], e["id"]))
+def list_lines(expenses, presorted=False):
+    rows = expenses if presorted else sorted(expenses, key=lambda e: (e["date"], e["id"]))
     lines = [f"{e['id']:>4}  {e['date']}  {fmt(e['cents']):>11}  {e['category']:<12} {e['note']}" for e in rows]
     lines.append(f"      Total: {fmt(sum(e['cents'] for e in rows))}")
     return lines
@@ -103,6 +103,67 @@ def summary_lines(expenses, month, width=30):
         lines.append(f"  {cat:<12} {fmt(cents):>11} {pct:5.1f}%  {bar}")
     lines.append(f"  {'TOTAL':<12} {fmt(total):>11}")
     return lines
+
+
+def set_budget(data, category, cents):
+    """Set a monthly budget for a category; cents=0 removes it."""
+    budgets = data.setdefault("budgets", {})
+    category = category.strip().lower()
+    if cents:
+        budgets[category] = cents
+    else:
+        budgets.pop(category, None)
+
+
+def budget_report(data, month, warn_at=0.9):
+    """Rows of (category, budget, spent, remaining, status) for budgeted categories."""
+    spent = {}
+    for e in data["expenses"]:
+        if e["date"].startswith(month):
+            spent[e["category"]] = spent.get(e["category"], 0) + e["cents"]
+    rows = []
+    for cat, budget in sorted(data.get("budgets", {}).items()):
+        used = spent.get(cat, 0)
+        if used > budget:
+            status = "OVER"
+        elif used >= budget * warn_at:
+            status = "WARN"
+        else:
+            status = "ok"
+        rows.append((cat, budget, used, budget - used, status))
+    return rows
+
+
+def budget_lines(data, month):
+    rows = budget_report(data, month)
+    if not rows:
+        return ["  No budgets set."]
+    lines = [f"  Budgets for {month}",
+             f"  {'category':<12} {'budget':>11} {'spent':>11} {'left':>12}  status"]
+    for cat, budget, used, left, status in rows:
+        left_s = fmt(left) if left >= 0 else "-" + fmt(-left)
+        lines.append(f"  {cat:<12} {fmt(budget):>11} {fmt(used):>11} {left_s:>12}  {status}")
+    for cat, budget, used, left, status in rows:
+        if status == "OVER":
+            lines.append(f"  ! {cat} is over budget by {fmt(-left)}")
+        elif status == "WARN":
+            lines.append(f"  ! {cat} has used {100 * used // budget}% of its budget")
+    return lines
+
+
+SORT_KEYS = {"date": lambda e: (e["date"], e["id"]), "amount": lambda e: (e["cents"], e["id"])}
+
+
+def filter_expenses(expenses, start=None, end=None, category=None, text=None, sort="date", desc=False):
+    """Filter by inclusive date range, exact category and note substring (case-insensitive)."""
+    category = category.strip().lower() if category else None
+    text = text.lower() if text else None
+    rows = [e for e in expenses
+            if (not start or e["date"] >= start)
+            and (not end or e["date"] <= end)
+            and (not category or e["category"] == category)
+            and (not text or text in e["note"].lower())]
+    return sorted(rows, key=SORT_KEYS[sort], reverse=desc)
 
 
 def ask(prompt, parse, default=None):
@@ -165,22 +226,61 @@ def prompt_delete(data):
 
 
 def prompt_summary(data):
+    print("\n".join(summary_lines(data["expenses"], ask_month())))
+
+
+def ask_month():
     this_month = date.today().isoformat()[:7]
-    month = ask(f"Month [YYYY-MM, blank = {this_month}]: ",
-                lambda t: parse_date(t + "-01")[:7], this_month)
-    print("\n".join(summary_lines(data["expenses"], month)))
+    return ask(f"Month [YYYY-MM, blank = {this_month}]: ",
+               lambda t: parse_date(t + "-01")[:7], this_month)
+
+
+def prompt_budgets(data):
+    while True:
+        print("\n".join(budget_lines(data, date.today().isoformat()[:7])))
+        choice = input("s) Set budget  r) Report for another month  b) Back\n> ").strip().lower()
+        if choice == "s":
+            category = ask_category(data)
+            cents = ask("Monthly budget (0 = remove): ",
+                        lambda t: 0 if t.strip() in ("0", "0.00") else parse_amount(t))
+            set_budget(data, category, cents)
+            save(data)
+        elif choice == "r":
+            print("\n".join(budget_lines(data, ask_month())))
+        elif choice == "b":
+            return
+
+
+def prompt_search(data):
+    print("  Blank skips a filter.")
+    start = ask("From date: ", parse_date, "")
+    end = ask("To date: ", parse_date, "")
+    category = input("Category: ").strip()
+    text = input("Note contains: ").strip()
+    def parse_sort(t):
+        if t.lower() not in SORT_KEYS:
+            raise ValueError("enter date or amount")
+        return t.lower()
+    sort = ask("Sort by [date/amount, blank = date]: ", parse_sort, "date")
+    desc = input("Descending? [y/N]: ").strip().lower() == "y"
+    rows = filter_expenses(data["expenses"], start, end, category, text, sort, desc)
+    print("\n".join(list_lines(rows, presorted=True)) if rows else "  No matches.")
 
 
 def main():
     data = load()
     while True:
         print("\n== Expense Tracker ==\n1) Add expense\n2) List expenses\n3) Edit expense\n"
-              "4) Delete expense\n5) Monthly summary\nq) Quit")
+              "4) Delete expense\n5) Monthly summary\n6) Budgets\n7) Search & filter\nq) Quit")
         choice = input("> ").strip().lower()
         if choice == "q":
             break
-        if choice in ("2", "3", "4", "5") and not data["expenses"]:
+        if choice in ("2", "3", "4", "5", "7") and not data["expenses"]:
             print("  No expenses yet.")
+        elif choice == "6":
+            prompt_budgets(data)
+        elif choice == "7":
+            prompt_search(data)
         elif choice == "1":
             prompt_add(data)
         elif choice == "2":
@@ -228,6 +328,26 @@ def selfcheck():
     out = summary_lines(data["expenses"], "2026-09")
     assert "87.5%" in out[1] and out[1].endswith("#" * 30) and "$20.00" in out[-1]
     assert summary_lines(data["expenses"], "2020-01") == ["  No expenses in 2020-01."]
+    assert budget_lines(data, "2026-09") == ["  No budgets set."]
+    set_budget(data, " Food ", 1800)
+    set_budget(data, "transport", 200)
+    set_budget(data, "fun", 5000)
+    rep = {r[0]: r for r in budget_report(data, "2026-09")}
+    assert rep["food"] == ("food", 1800, 1750, 50, "WARN")
+    assert rep["transport"] == ("transport", 200, 250, -50, "OVER")
+    assert rep["fun"][4] == "ok" and rep["fun"][2] == 0
+    out = budget_lines(data, "2026-09")
+    assert any("transport is over budget by $0.50" in l for l in out)
+    assert any("food has used 97%" in l for l in out)
+    set_budget(data, "fun", 0)
+    assert "fun" not in data["budgets"]
+    exps = data["expenses"]
+    assert [e["id"] for e in filter_expenses(exps)] == [4, 2, 1, 3]
+    assert [e["id"] for e in filter_expenses(exps, start="2026-09-01", end="2026-09-02")] == [2, 1]
+    assert [e["id"] for e in filter_expenses(exps, category=" FOOD")] == [1, 3]
+    assert [e["id"] for e in filter_expenses(exps, text="LUN")] == [1]
+    assert [e["id"] for e in filter_expenses(exps, sort="amount", desc=True)] == [4, 1, 3, 2]
+    assert filter_expenses(exps, start="2027-01-01") == []
     assert delete_expense(data, 4)["category"] == "rent" and find(data, 4) is None
     assert delete_expense(data, 99) is None
     with tempfile.TemporaryDirectory() as d:
