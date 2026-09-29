@@ -33,7 +33,9 @@ def load(path=DATA_FILE):
     if not os.path.exists(path):
         return {"next_id": 1, "expenses": []}
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    data["expenses"], data["next_id"]  # KeyError if the file isn't ours
+    return data
 
 
 def save(data, path=DATA_FILE):
@@ -52,6 +54,8 @@ def add_expense(data, day, cents, category, note=""):
 
 
 def list_lines(expenses, presorted=False):
+    if not expenses:
+        return ["  No expenses."]
     rows = expenses if presorted else sorted(expenses, key=lambda e: (e["date"], e["id"]))
     lines = [f"{e['id']:>4}  {e['date']}  {fmt(e['cents']):>11}  {e['category']:<12} {e['note']}" for e in rows]
     lines.append(f"      Total: {fmt(sum(e['cents'] for e in rows))}")
@@ -247,8 +251,10 @@ def top_categories(expenses, n=5):
 def trend_lines(expenses):
     def pc(v):
         return "   new" if v is None else f"{v:+6.1f}%"
-    lines = [f"  {'month':<8} {'total':>11} {'vs prev':>8} {'3m avg':>11}"]
     rows = trends(expenses)
+    if not rows:
+        return ["  No expenses to chart."]
+    lines = [f"  {'month':<8} {'total':>11} {'vs prev':>8} {'3m avg':>11}"]
     for m, total, change, avg, _ in rows:
         lines.append(f"  {m:<8} {fmt(total):>11} {'-' if change is None else pc(change):>8} {fmt(avg):>11}")
     m, _, _, _, cats = rows[-1]
@@ -384,37 +390,52 @@ def prompt_import(data):
         print(f"  ! {e}")
 
 
+MENU = [  # (key, label, handler, needs_data)
+    ("1", "Add expense", prompt_add, False),
+    ("2", "List expenses", lambda d: print("\n".join(list_lines(d["expenses"]))), True),
+    ("3", "Edit expense", prompt_edit, True),
+    ("4", "Delete expense", prompt_delete, True),
+    ("5", "Monthly summary", prompt_summary, True),
+    ("6", "Budgets", prompt_budgets, False),
+    ("7", "Search & filter", prompt_search, True),
+    ("8", "Export CSV", prompt_export, True),
+    ("9", "Import CSV", prompt_import, False),
+    ("t", "Trends", lambda d: print("\n".join(trend_lines(d["expenses"]))), True),
+]
+
+
+def menu_text(data):
+    n, total = len(data["expenses"]), sum(e["cents"] for e in data["expenses"])
+    lines = ["", "=" * 34, f" Expense Tracker  ({n} expenses, {fmt(total)})", "=" * 34]
+    lines += [f"  {k})  {label}" for k, label, _, _ in MENU]
+    lines.append("  q)  Quit")
+    return "\n".join(lines)
+
+
 def main():
-    data = load()
+    try:
+        data = load()
+    except (json.JSONDecodeError, KeyError, TypeError) as err:
+        # Don't start with empty data and overwrite the user's file on the next save.
+        sys.exit(f"Could not read {DATA_FILE}: {err}\nFix or move the file, then retry.")
+    handlers = {k: (h, needs) for k, _, h, needs in MENU}
     while True:
-        print("\n== Expense Tracker ==\n1) Add expense\n2) List expenses\n3) Edit expense\n"
-              "4) Delete expense\n5) Monthly summary\n6) Budgets\n7) Search & filter\n"
-              "8) Export CSV\n9) Import CSV\nt) Trends\nq) Quit")
-        choice = input("> ").strip().lower()
-        if choice == "q":
+        print(menu_text(data))
+        try:
+            choice = input("> ").strip().lower()
+            if choice == "q":
+                break
+            if choice not in handlers:
+                print("  ! Unknown choice.")
+                continue
+            handler, needs_data = handlers[choice]
+            if needs_data and not data["expenses"]:
+                print("  No expenses yet - add one first (1) or import a CSV (9).")
+            else:
+                handler(data)
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Bye.")
             break
-        if choice in ("2", "3", "4", "5", "7", "8", "t") and not data["expenses"]:
-            print("  No expenses yet.")
-        elif choice == "8":
-            prompt_export(data)
-        elif choice == "9":
-            prompt_import(data)
-        elif choice == "t":
-            print("\n".join(trend_lines(data["expenses"])))
-        elif choice == "6":
-            prompt_budgets(data)
-        elif choice == "7":
-            prompt_search(data)
-        elif choice == "1":
-            prompt_add(data)
-        elif choice == "2":
-            print("\n".join(list_lines(data["expenses"])))
-        elif choice == "3":
-            prompt_edit(data)
-        elif choice == "4":
-            prompt_delete(data)
-        elif choice == "5":
-            prompt_summary(data)
 
 
 def selfcheck():
@@ -506,6 +527,24 @@ def selfcheck():
     assert top_categories(t["expenses"]) == [("rent", 35000), ("food", 25000)]
     out = trend_lines(t["expenses"])
     assert "+200.0%" in out[2] and any("food" in l and "-75.0%" in l for l in out)
+    # Polish: empty-data guards, menu, corrupt-file detection
+    assert list_lines([]) == ["  No expenses."]
+    assert trend_lines([]) == ["  No expenses to chart."]
+    assert month_summary([], "2026-09") == (0, [])
+    assert top_categories([]) == [] and categories({"expenses": []}) == []
+    assert len({k for k, *_ in MENU}) == len(MENU) and all(callable(h) for _, _, h, _ in MENU)
+    m = menu_text(t)
+    assert "(5 expenses, $600.00)" in m and "t)  Trends" in m and m.rstrip().endswith("q)  Quit")
+    with tempfile.TemporaryDirectory() as d:
+        bad = os.path.join(d, "bad.json")
+        for content in ("{not json", "[]", '{"foo": 1}'):
+            with open(bad, "w", encoding="utf-8") as f:
+                f.write(content)
+            try:
+                load(bad)
+                raise AssertionError(f"loaded corrupt file {content!r}")
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
     print("selfcheck OK")
 
 

@@ -9,4 +9,4 @@ Python CLI. Log expenses by category to a JSON file, with monthly summaries, bud
 - [x] 5. Search & filter: by date range, category, and note text; sortable by date or amount.
 - [x] 6. CSV export and import (csv module), with duplicate detection on import and a round-trip check.
 - [x] 7. Trends report: month-over-month change per category, 3-month rolling average, top categories across all months.
-- [ ] 8. Polish: cleaner menu formatting, empty-data guards, README with run instructions, extended assert-based self-check.
+- [x] 8. Polish: cleaner menu formatting, empty-data guards, README with run instructions, extended assert-based self-check.
