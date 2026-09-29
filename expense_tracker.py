@@ -2,6 +2,7 @@
 Standard library only. Amounts are stored as integer cents.
 """
 
+import csv
 import json
 import os
 import sys
@@ -166,6 +167,101 @@ def filter_expenses(expenses, start=None, end=None, category=None, text=None, so
     return sorted(rows, key=SORT_KEYS[sort], reverse=desc)
 
 
+CSV_FIELDS = ["date", "amount", "category", "note"]
+
+
+def export_csv(expenses, path):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(CSV_FIELDS)
+        for e in sorted(expenses, key=SORT_KEYS["date"]):
+            w.writerow([e["date"], fmt(e["cents"])[1:].replace(",", ""), e["category"], e["note"]])
+    return len(expenses)
+
+
+def _key(day, cents, category, note):
+    return (day, cents, category.strip().lower(), note.strip())
+
+
+def import_csv(data, path):
+    """Add rows from a CSV. Skips rows already present (same date/amount/category/note).
+    Returns (added, duplicates, [error strings])."""
+    seen = {_key(e["date"], e["cents"], e["category"], e["note"]) for e in data["expenses"]}
+    added = dups = 0
+    errors = []
+    with open(path, newline="", encoding="utf-8") as f:
+        for n, row in enumerate(csv.DictReader(f), start=2):
+            try:
+                day = parse_date(row.get("date") or "")
+                cents = parse_amount((row.get("amount") or "").replace(",", ""))
+            except ValueError as err:
+                errors.append(f"line {n}: {err}")
+                continue
+            key = _key(day, cents, row.get("category") or "misc", row.get("note") or "")
+            if key in seen:
+                dups += 1
+                continue
+            seen.add(key)
+            add_expense(data, day, cents, key[2], key[3])
+            added += 1
+    return added, dups, errors
+
+
+def monthly_totals(expenses):
+    """{month: {category: cents}}"""
+    out = {}
+    for e in expenses:
+        cats = out.setdefault(e["date"][:7], {})
+        cats[e["category"]] = cats.get(e["category"], 0) + e["cents"]
+    return out
+
+
+def trends(expenses):
+    """Per month (oldest first): (month, total, change_vs_prev_pct or None, rolling_3m_avg,
+    {category: change_pct or None}). Rolling average covers up to the last 3 months present."""
+    by_month = monthly_totals(expenses)
+    months = sorted(by_month)
+    rows = []
+    for i, m in enumerate(months):
+        total = sum(by_month[m].values())
+        prev = by_month[months[i - 1]] if i else None
+        window = [sum(by_month[x].values()) for x in months[max(0, i - 2):i + 1]]
+        change = None if prev is None else pct_change(sum(prev.values()), total)
+        cat_changes = {c: (None if prev is None else pct_change(prev.get(c, 0), v))
+                       for c, v in by_month[m].items()}
+        rows.append((m, total, change, sum(window) // len(window), cat_changes))
+    return rows
+
+
+def pct_change(old, new):
+    return None if old == 0 else 100 * (new - old) / old
+
+
+def top_categories(expenses, n=5):
+    totals = {}
+    for e in expenses:
+        totals[e["category"]] = totals.get(e["category"], 0) + e["cents"]
+    return sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
+def trend_lines(expenses):
+    def pc(v):
+        return "   new" if v is None else f"{v:+6.1f}%"
+    lines = [f"  {'month':<8} {'total':>11} {'vs prev':>8} {'3m avg':>11}"]
+    rows = trends(expenses)
+    for m, total, change, avg, _ in rows:
+        lines.append(f"  {m:<8} {fmt(total):>11} {'-' if change is None else pc(change):>8} {fmt(avg):>11}")
+    m, _, _, _, cats = rows[-1]
+    if len(rows) > 1:
+        lines.append(f"  Category change in {m}:")
+        for c, v in sorted(cats.items(), key=lambda kv: kv[0]):
+            lines.append(f"    {c:<12} {pc(v)}")
+    lines.append("  Top categories (all time):")
+    for c, v in top_categories(expenses):
+        lines.append(f"    {c:<12} {fmt(v):>11}")
+    return lines
+
+
 def ask(prompt, parse, default=None):
     """Re-prompt until parse() accepts the input. Blank returns default when given."""
     while True:
@@ -267,16 +363,44 @@ def prompt_search(data):
     print("\n".join(list_lines(rows, presorted=True)) if rows else "  No matches.")
 
 
+def prompt_export(data):
+    path = input("Export to [expenses.csv]: ").strip() or "expenses.csv"
+    try:
+        print(f"  Exported {export_csv(data['expenses'], path)} expenses to {path}")
+    except OSError as err:
+        print(f"  ! {err}")
+
+
+def prompt_import(data):
+    path = input("Import from CSV: ").strip()
+    try:
+        added, dups, errors = import_csv(data, path)
+    except OSError as err:
+        print(f"  ! {err}")
+        return
+    save(data)
+    print(f"  Imported {added}, skipped {dups} duplicates, {len(errors)} bad rows.")
+    for e in errors[:10]:
+        print(f"  ! {e}")
+
+
 def main():
     data = load()
     while True:
         print("\n== Expense Tracker ==\n1) Add expense\n2) List expenses\n3) Edit expense\n"
-              "4) Delete expense\n5) Monthly summary\n6) Budgets\n7) Search & filter\nq) Quit")
+              "4) Delete expense\n5) Monthly summary\n6) Budgets\n7) Search & filter\n"
+              "8) Export CSV\n9) Import CSV\nt) Trends\nq) Quit")
         choice = input("> ").strip().lower()
         if choice == "q":
             break
-        if choice in ("2", "3", "4", "5", "7") and not data["expenses"]:
+        if choice in ("2", "3", "4", "5", "7", "8", "t") and not data["expenses"]:
             print("  No expenses yet.")
+        elif choice == "8":
+            prompt_export(data)
+        elif choice == "9":
+            prompt_import(data)
+        elif choice == "t":
+            print("\n".join(trend_lines(data["expenses"])))
         elif choice == "6":
             prompt_budgets(data)
         elif choice == "7":
@@ -355,6 +479,33 @@ def selfcheck():
         save(data, p)
         assert load(p) == data
         assert load(os.path.join(d, "missing.json"))["expenses"] == []
+        # CSV round-trip: export, import into empty data, same expenses back
+        add_expense(data, "2026-09-04", 123456, "gear", 'big, "quoted" note')
+        c = os.path.join(d, "e.csv")
+        assert export_csv(data["expenses"], c) == 4
+        fresh = {"next_id": 1, "expenses": []}
+        assert import_csv(fresh, c) == (4, 0, [])
+        strip = lambda es: sorted((e["date"], e["cents"], e["category"], e["note"]) for e in es)
+        assert strip(fresh["expenses"]) == strip(data["expenses"])
+        assert import_csv(fresh, c) == (0, 4, [])  # all duplicates second time
+        with open(c, "a", encoding="utf-8") as f:
+            f.write("2026-13-01,5,food,\n2026-10-01,abc,food,\n2026-10-02,7.5,Food,new\n")
+        added, dups, errs = import_csv(fresh, c)
+        assert (added, dups, len(errs)) == (1, 4, 2) and errs[0].startswith("line 6")
+    # Trends: Jul 100, Aug 300 (food 200 new), Sep 200
+    t = {"next_id": 1, "expenses": []}
+    for day, cents, cat in [("2026-07-05", 10000, "rent"), ("2026-08-05", 10000, "rent"),
+                            ("2026-08-09", 20000, "food"), ("2026-09-01", 15000, "rent"),
+                            ("2026-09-02", 5000, "food")]:
+        add_expense(t, day, cents, cat)
+    rows = trends(t["expenses"])
+    assert [r[0] for r in rows] == ["2026-07", "2026-08", "2026-09"]
+    assert rows[0][2] is None and rows[1][2] == 200 and abs(rows[2][2] + 100 / 3) < 1e-9
+    assert [r[3] for r in rows] == [10000, 20000, 20000]
+    assert rows[1][4] == {"rent": 0, "food": None} and rows[2][4] == {"rent": 50, "food": -75}
+    assert top_categories(t["expenses"]) == [("rent", 35000), ("food", 25000)]
+    out = trend_lines(t["expenses"])
+    assert "+200.0%" in out[2] and any("food" in l and "-75.0%" in l for l in out)
     print("selfcheck OK")
 
 
